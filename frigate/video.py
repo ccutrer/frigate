@@ -743,6 +743,8 @@ def process_frames(
 
     region_min_size = int(max(model_config.height, model_config.width) / 2)
 
+    if camera_name == "sewing":
+      start_pop = time.process_time()
     while not stop_event.is_set():
         if exit_on_empty and frame_queue.empty():
             logger.info("Exiting track_objects...")
@@ -752,6 +754,11 @@ def process_frames(
             frame_time = frame_queue.get(True, 1)
         except queue.Empty:
             continue
+
+        if camera_name == "sewing":
+           start = time.process_time()
+           logger.info(f"Took {start - start_pop}s of CPU time to get a frame")
+           start_pop = start
 
         current_frame_time.value = frame_time
 
@@ -1029,3 +1036,5 @@ def process_frames(
             )
             detection_fps.value = object_detector.fps.eps()
             frame_manager.close(f"{camera_name}{frame_time}")
+        if camera_name == "sewing":
+          logger.info(f"took {time.process_time() - start}s to process a frame in sewing")
