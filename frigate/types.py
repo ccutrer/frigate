@@ -13,7 +13,7 @@ class CameraMetricsTypes(TypedDict):
     detection_fps: Synchronized
     detection_frame: Synchronized
     ffmpeg_pid: Synchronized
-    frame_queue: Queue
+    frame_queue: list[int]
     motion_enabled: Synchronized
     improve_contrast_enabled: Synchronized
     motion_threshold: Synchronized

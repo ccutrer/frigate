@@ -127,7 +127,7 @@ class FrigateApp:
                 "detection_frame": mp.Value("d", 0.0),
                 "read_start": mp.Value("d", 0.0),
                 "ffmpeg_pid": mp.Value("i", 0),
-                "frame_queue": mp.Queue(maxsize=2),
+                "frame_queue": os.pipe2(os.O_NONBLOCK | os.O_DIRECT),
                 "capture_process": None,
                 "process": None,
             }

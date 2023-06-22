@@ -72,7 +72,7 @@ class ProcessClip:
             c["cmd"] for c in self.camera_config.ffmpeg_cmds if "detect" in c["roles"]
         ][0]
         self.frame_manager = SharedMemoryFrameManager()
-        self.frame_queue = mp.Queue()
+        self.frame_queue = os.pipe()
         self.detected_objects_queue = mp.Queue()
         self.camera_state = CameraState(self.camera_name, config, self.frame_manager)
 

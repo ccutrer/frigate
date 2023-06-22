@@ -4,8 +4,10 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import select
 import signal
 import subprocess as sp
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -170,11 +172,14 @@ def capture_frames(
     frame_rate.start()
     skipped_eps = EventsPerSecond()
     skipped_eps.start()
+    last_time = datetime.datetime.now().timestamp()
     while True:
-        fps.value = frame_rate.eps()
-        skipped_eps.eps()
-
         frame_time = datetime.datetime.now().timestamp()
+        # only update stats once per second
+        if frame_time - last_time > 1:
+          fps.value = frame_rate.eps()
+          skipped_eps.eps()
+
         current_frame.value = frame_time
         frame_name = f"{camera_name}{frame_time}"
         frame_buffer = frame_manager.create(frame_name, frame_size)
@@ -196,18 +201,15 @@ def capture_frames(
 
         frame_rate.update()
 
-        # if the queue is full, skip this frame
-        if frame_queue.full():
+        # add to the queue
+        try:
+            os.write(frame_queue[1], struct.pack("d", frame_time))
+            # close the frame
+            frame_manager.close(frame_name)
+        except BlockingIOError:
+            # if the queue is full, skip this frame
             skipped_eps.update()
             frame_manager.delete(frame_name)
-            continue
-
-        # close the frame
-        frame_manager.close(frame_name)
-
-        # add to the queue
-        frame_queue.put(frame_time)
-
 
 class CameraWatchdog(threading.Thread):
     def __init__(
@@ -707,7 +709,7 @@ def get_consolidated_object_detections(detected_object_groups):
 
 def process_frames(
     camera_name: str,
-    frame_queue: mp.Queue,
+    frame_queue: list[int],
     frame_shape,
     model_config,
     detect_config: DetectConfig,
@@ -744,13 +746,14 @@ def process_frames(
     region_min_size = int(max(model_config.height, model_config.width) / 2)
 
     while not stop_event.is_set():
-        if exit_on_empty and frame_queue.empty():
-            logger.info("Exiting track_objects...")
-            break
-
         try:
-            frame_time = frame_queue.get(True, 1)
-        except queue.Empty:
+            bytes = os.read(frame_queue[0], 8)
+            frame_time = struct.unpack("d", bytes)[0]
+        except BlockingIOError:
+            if exit_on_empty:
+                logger.info("Exiting track_objects...")
+                break
+            r, _, _ = select.select([frame_queue[0]], [], [], 1)
             continue
 
         current_frame_time.value = frame_time
