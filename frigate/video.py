@@ -170,12 +170,14 @@ def capture_frames(
     frame_rate.start()
     skipped_eps = EventsPerSecond()
     skipped_eps.start()
+    last_update = 0
     while True:
-        fps.value = frame_rate.eps()
-        skipped_fps.value = skipped_eps.eps()
-
         frame_time = datetime.datetime.now().timestamp()
-        current_frame.value = frame_time
+        if frame_time - last_update > 1:
+          fps.value = frame_rate.eps()
+          skipped_fps.value = skipped_eps.eps()
+          current_frame.value = frame_time
+
         frame_name = f"{camera_name}{frame_time}"
         frame_buffer = frame_manager.create(frame_name, frame_size)
         try:
