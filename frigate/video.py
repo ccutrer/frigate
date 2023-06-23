@@ -174,8 +174,9 @@ def capture_frames(
         fps.value = frame_rate.eps()
         skipped_eps.eps()
 
-        current_frame.value = datetime.datetime.now().timestamp()
-        frame_name = f"{camera_name}{current_frame.value}"
+        frame_time = datetime.datetime.now().timestamp()
+        current_frame.value = frame_time
+        frame_name = f"{camera_name}{frame_time}"
         frame_buffer = frame_manager.create(frame_name, frame_size)
         try:
             frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
@@ -205,7 +206,7 @@ def capture_frames(
         frame_manager.close(frame_name)
 
         # add to the queue
-        frame_queue.put(current_frame.value)
+        frame_queue.put(frame_time)
 
 
 class CameraWatchdog(threading.Thread):
