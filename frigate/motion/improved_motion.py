@@ -1,6 +1,7 @@
 import cv2
 import imutils
 import numpy as np
+import time
 
 from frigate.config import MotionConfig
 from frigate.motion import MotionDetector
@@ -43,9 +44,22 @@ class ImprovedMotionDetector(MotionDetector):
         self.threshold = threshold
         self.contour_area = contour_area
         self.clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
+        self.last_config_update = time.perf_counter()
+        self.local_improve_contrast = self.improve_contrast.value
+        self.local_threshold = self.threshold.value
+        self.local_contour_area = self.contour_area.value
+
 
     def detect(self, frame):
         motion_boxes = []
+
+        # only update config every 5 seconds to reduce lock contention
+        now = time.perf_counter()
+        if now - self.last_config_update > 5:
+          self.last_config_update = now
+          self.local_improve_contrast = self.improve_contrast.value
+          self.local_threshold = self.threshold.value
+          self.local_contour_area = self.contour_area.value
 
         gray = frame[0 : self.frame_shape[0], 0 : self.frame_shape[1]]
 
@@ -65,7 +79,7 @@ class ImprovedMotionDetector(MotionDetector):
             blurred_saved = resized_frame.copy()
 
         # Improve contrast
-        if self.improve_contrast.value:
+        if self.local_improve_contrast:
             resized_frame = self.clahe.apply(resized_frame)
 
         if self.save_images:
@@ -81,7 +95,7 @@ class ImprovedMotionDetector(MotionDetector):
 
         # compute the threshold image for the current frame
         thresh = cv2.threshold(
-            frameDelta, self.threshold.value, 255, cv2.THRESH_BINARY
+            frameDelta, self.local_threshold, 255, cv2.THRESH_BINARY
         )[1]
 
         # dilate the thresholded image to fill in holes, then find contours
@@ -98,7 +112,7 @@ class ImprovedMotionDetector(MotionDetector):
             # if the contour is big enough, count it as motion
             contour_area = cv2.contourArea(c)
             total_contour_area += contour_area
-            if contour_area > self.contour_area.value:
+            if contour_area > self.local_contour_area:
                 x, y, w, h = cv2.boundingRect(c)
                 motion_boxes.append(
                     (
