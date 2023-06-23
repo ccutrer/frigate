@@ -750,6 +750,9 @@ def process_frames(
     startup_scan_counter = 0
 
     region_min_size = int(max(model_config.height, model_config.width) / 2)
+    local_detection_enabled = detection_enabled.value
+    local_motion_enabled = motion_enabled.value
+    last_update = time.perf_counter()
 
     if camera_name == "sewing":
       start_pop = time.process_time()
@@ -767,7 +770,11 @@ def process_frames(
            logger.info(f"Took {start - start_pop}s of CPU time to get a frame")
            start_pop = start
 
-        current_frame_time.value = frame_time
+        now = time.perf_counter()
+        if now - last_update > 1:
+            current_frame_time.value = frame_time
+            local_detection_enabled = detection_enabled.value
+            local_motion_enabled = motion_enabled.value
 
         frame = frame_manager.get(
             f"{camera_name}{frame_time}", (frame_shape[0] * 3 // 2, frame_shape[1])
@@ -778,13 +785,13 @@ def process_frames(
             continue
 
         # look for motion if enabled
-        motion_boxes = motion_detector.detect(frame) if motion_enabled.value else []
+        motion_boxes = motion_detector.detect(frame) if local_motion_enabled else []
 
         regions = []
         consolidated_detections = []
 
         # if detection is disabled
-        if not detection_enabled.value:
+        if not local_detection_enabled:
             object_tracker.match_and_update(frame_time, [])
         else:
             # get stationary object ids
