@@ -46,7 +46,7 @@ from frigate.storage import StorageMaintainer
 from frigate.timeline import TimelineProcessor
 from frigate.types import CameraMetricsTypes, RecordMetricsTypes
 from frigate.version import VERSION
-from frigate.video import capture_camera, track_camera
+from frigate.video import capture_camera
 from frigate.watchdog import FrigateWatchdog
 
 logger = logging.getLogger(__name__)
@@ -127,7 +127,6 @@ class FrigateApp:
                 "detection_frame": mp.Value("d", 0.0),
                 "read_start": mp.Value("d", 0.0),
                 "ffmpeg_pid": mp.Value("i", 0),
-                "frame_queue": mp.Queue(maxsize=2),
                 "capture_process": None,
                 "process": None,
             }
@@ -349,31 +348,6 @@ class FrigateApp:
         output_processor.start()
         logger.info(f"Output process started: {output_processor.pid}")
 
-    def start_camera_processors(self) -> None:
-        for name, config in self.config.cameras.items():
-            if not self.config.cameras[name].enabled:
-                logger.info(f"Camera processor not started for disabled camera {name}")
-                continue
-
-            camera_process = mp.Process(
-                target=track_camera,
-                name=f"camera_processor:{name}",
-                args=(
-                    name,
-                    config,
-                    self.config.model,
-                    self.config.model.merged_labelmap,
-                    self.detection_queue,
-                    self.detection_out_events[name],
-                    self.detected_frames_queue,
-                    self.camera_metrics[name],
-                ),
-            )
-            camera_process.daemon = True
-            self.camera_metrics[name]["process"] = camera_process
-            camera_process.start()
-            logger.info(f"Camera processor started for {name}: {camera_process.pid}")
-
     def start_camera_capture_processes(self) -> None:
         for name, config in self.config.cameras.items():
             if not self.config.cameras[name].enabled:
@@ -383,7 +357,14 @@ class FrigateApp:
             capture_process = mp.Process(
                 target=capture_camera,
                 name=f"camera_capture:{name}",
-                args=(name, config, self.camera_metrics[name]),
+                args=(name,
+                      config,
+                      self.config.model,
+                      self.config.model.merged_labelmap,
+                      self.detection_queue,
+                      self.detection_out_events[name],
+                      self.detected_frames_queue,
+                      self.camera_metrics[name]),
             )
             capture_process.daemon = True
             self.camera_metrics[name]["capture_process"] = capture_process
@@ -484,7 +465,6 @@ class FrigateApp:
         self.start_detectors()
         self.start_video_output_processor()
         self.start_detected_frames_processor()
-        self.start_camera_processors()
         self.start_camera_capture_processes()
         self.start_storage_maintainer()
         self.init_stats()

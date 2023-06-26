@@ -20,6 +20,7 @@ from frigate.detectors.detector_config import PixelFormatEnum
 from frigate.log import LogPipe
 from frigate.motion import MotionDetector
 from frigate.motion.improved_motion import ImprovedMotionDetector
+from frigate.motion.frigate_motion import FrigateMotionDetector
 from frigate.object_detection import RemoteObjectDetector
 from frigate.track import ObjectTracker
 from frigate.track.norfair_tracker import NorfairTracker
@@ -158,8 +159,8 @@ def capture_frames(
     ffmpeg_process,
     camera_name,
     frame_shape,
+    frame_processor,
     frame_manager: FrameManager,
-    frame_queue,
     fps: mp.Value,
     skipped_fps: mp.Value,
     current_frame: mp.Value,
@@ -198,15 +199,8 @@ def capture_frames(
 
         frame_rate.update()
 
-        try:
-            # add to the queue
-            frame_queue.put(frame_time, False)
-            # close the frame
-            frame_manager.close(frame_name)
-        except queue.Full:
-            # if the queue is full, skip this frame
-            skipped_eps.update()
-            frame_manager.delete(frame_name)
+        # frame_processor will close/delete the frame as necessary
+        frame_processor.process_frame(frame_time, frame_name, frame_manager)
 
 
 class CameraWatchdog(threading.Thread):
@@ -214,7 +208,7 @@ class CameraWatchdog(threading.Thread):
         self,
         camera_name,
         config: CameraConfig,
-        frame_queue,
+        frame_processor,
         camera_fps,
         skipped_fps,
         ffmpeg_pid,
@@ -231,7 +225,7 @@ class CameraWatchdog(threading.Thread):
         self.camera_fps = camera_fps
         self.skipped_fps = skipped_fps
         self.ffmpeg_pid = ffmpeg_pid
-        self.frame_queue = frame_queue
+        self.frame_processor = frame_processor
         self.frame_shape = self.config.frame_shape_yuv
         self.frame_size = self.frame_shape[0] * self.frame_shape[1]
         self.stop_event = stop_event
@@ -347,7 +341,7 @@ class CameraWatchdog(threading.Thread):
             self.camera_name,
             self.ffmpeg_detect_process,
             self.frame_shape,
-            self.frame_queue,
+            self.frame_processor,
             self.camera_fps,
             self.skipped_fps,
             self.stop_event,
@@ -384,7 +378,7 @@ class CameraCapture(threading.Thread):
         camera_name,
         ffmpeg_process,
         frame_shape,
-        frame_queue,
+        frame_processor,
         fps,
         skipped_fps,
         stop_event,
@@ -393,7 +387,7 @@ class CameraCapture(threading.Thread):
         self.name = f"capture:{camera_name}"
         self.camera_name = camera_name
         self.frame_shape = frame_shape
-        self.frame_queue = frame_queue
+        self.frame_processor = frame_processor
         self.fps = fps
         self.stop_event = stop_event
         self.skipped_fps = skipped_fps
@@ -407,8 +401,8 @@ class CameraCapture(threading.Thread):
             self.ffmpeg_process,
             self.camera_name,
             self.frame_shape,
+            self.frame_processor,
             self.frame_manager,
-            self.frame_queue,
             self.fps,
             self.skipped_fps,
             self.current_frame,
@@ -416,7 +410,14 @@ class CameraCapture(threading.Thread):
         )
 
 
-def capture_camera(name, config: CameraConfig, process_info):
+def capture_camera(name,
+                   config: CameraConfig,
+                   model_config,
+                   labelmap,
+                   detection_queue,
+                   result_connection,
+                   detected_objects_queue,
+                   process_info):
     stop_event = mp.Event()
 
     def receiveSignal(signalNumber, frame):
@@ -428,11 +429,20 @@ def capture_camera(name, config: CameraConfig, process_info):
     threading.current_thread().name = f"capture:{name}"
     setproctitle(f"frigate.capture:{name}")
 
-    frame_queue = process_info["frame_queue"]
+    frame_processor = FrameProcessor(
+        name,
+        config,
+        model_config,
+        labelmap,
+        detection_queue,
+        result_connection,
+        detected_objects_queue,
+        process_info,
+        stop_event)
     camera_watchdog = CameraWatchdog(
         name,
         config,
-        frame_queue,
+        frame_processor,
         process_info["camera_fps"],
         process_info["skipped_fps"],
         process_info["ffmpeg_pid"],
@@ -442,359 +452,290 @@ def capture_camera(name, config: CameraConfig, process_info):
     camera_watchdog.join()
 
 
-def track_camera(
-    name,
-    config: CameraConfig,
-    model_config,
-    labelmap,
-    detection_queue,
-    result_connection,
-    detected_objects_queue,
-    process_info,
-):
-    stop_event = mp.Event()
+class FrameProcessor:
+    def __init__(
+            self,
+            camera_name: str,
+            config: CameraConfig,
+            model_config,
+            labelmap,
+            detection_queue,
+            result_connection,
+            detected_objects_queue: mp.Queue,
+            process_info: dict,
+            stop_event):
+        self.camera_name = camera_name
+        self.model_config = model_config
+        self.detect_config = config.detect
+        self.object_tracker = NorfairTracker(config.detect)
+        self.detected_objects_queue = detected_objects_queue
+        self.process_info = process_info
 
-    def receiveSignal(signalNumber, frame):
-        stop_event.set()
+        self.detection_enabled = process_info["detection_enabled"]
+        self.motion_enabled = process_info["motion_enabled"]
 
-    signal.signal(signal.SIGTERM, receiveSignal)
-    signal.signal(signal.SIGINT, receiveSignal)
+        improve_contrast_enabled = process_info["improve_contrast_enabled"]
+        motion_threshold = process_info["motion_threshold"]
+        motion_contour_area = process_info["motion_contour_area"]
 
-    threading.current_thread().name = f"process:{name}"
-    setproctitle(f"frigate.process:{name}")
-    listen()
+        self.frame_shape = config.frame_shape
+        self.objects_to_track = config.objects.track
+        self.object_filters = config.objects.filters
 
-    frame_queue = process_info["frame_queue"]
-    detection_enabled = process_info["detection_enabled"]
-    motion_enabled = process_info["motion_enabled"]
-    improve_contrast_enabled = process_info["improve_contrast_enabled"]
-    motion_threshold = process_info["motion_threshold"]
-    motion_contour_area = process_info["motion_contour_area"]
+        self.motion_detector = FrigateMotionDetector(
+            self.frame_shape,
+            config.motion,
+            config.detect.fps,
+            improve_contrast_enabled,
+            motion_threshold,
+            motion_contour_area,
+        )
+        self.object_detector = RemoteObjectDetector(
+            camera_name, labelmap, detection_queue, result_connection, model_config, stop_event
+        )
 
-    frame_shape = config.frame_shape
-    objects_to_track = config.objects.track
-    object_filters = config.objects.filters
+        # attribute labels are not tracked and are not assigned regions
+        self.attribute_label_map = {
+            "person": ["face", "amazon"],
+            "car": ["ups", "fedex", "amazon", "license_plate"],
+        }
+        self.all_attribute_labels = [
+            item for sublist in self.attribute_label_map.values() for item in sublist
+        ]
+        self.fps = process_info["process_fps"]
+        self.detection_fps = process_info["detection_fps"]
+        self.current_frame_time = process_info["detection_frame"]
 
-    motion_detector = ImprovedMotionDetector(
-        frame_shape,
-        config.motion,
-        config.detect.fps,
-        improve_contrast_enabled,
-        motion_threshold,
-        motion_contour_area,
-    )
-    object_detector = RemoteObjectDetector(
-        name, labelmap, detection_queue, result_connection, model_config, stop_event
-    )
+        self.fps_tracker = EventsPerSecond()
+        self.fps_tracker.start()
 
-    object_tracker = NorfairTracker(config.detect)
+        self.startup_scan_counter = 0
 
-    frame_manager = SharedMemoryFrameManager()
+        self.region_min_size = int(max(model_config.height, model_config.width) / 2)
+        self.local_detection_enabled = self.detection_enabled.value
+        self.local_motion_enabled = self.motion_enabled.value
+        self.last_update = time.perf_counter()
 
-    process_frames(
-        name,
-        frame_queue,
-        frame_shape,
-        model_config,
-        config.detect,
-        frame_manager,
-        motion_detector,
+    def box_overlaps(self, b1, b2):
+        if b1[2] < b2[0] or b1[0] > b2[2] or b1[1] > b2[3] or b1[3] < b2[1]:
+            return False
+        return True
+
+
+    def box_inside(self, b1, b2):
+        # check if b2 is inside b1
+        if b2[0] >= b1[0] and b2[1] >= b1[1] and b2[2] <= b1[2] and b2[3] <= b1[3]:
+            return True
+        return False
+
+
+    def reduce_boxes(self, boxes, iou_threshold=0.0):
+        clusters = []
+
+        for box in boxes:
+            matched = 0
+            for cluster in clusters:
+                if intersection_over_union(box, cluster) > iou_threshold:
+                    matched = 1
+                    cluster[0] = min(cluster[0], box[0])
+                    cluster[1] = min(cluster[1], box[1])
+                    cluster[2] = max(cluster[2], box[2])
+                    cluster[3] = max(cluster[3], box[3])
+
+            if not matched:
+                clusters.append(list(box))
+
+        return [tuple(c) for c in clusters]
+
+
+    def intersects_any(self, box_a, boxes):
+        for box in boxes:
+            if self.box_overlaps(box_a, box):
+                return True
+        return False
+
+
+    def detect(
+        self,
+        detect_config: DetectConfig,
         object_detector,
-        object_tracker,
-        detected_objects_queue,
-        process_info,
+        frame,
+        model_config,
+        region,
         objects_to_track,
         object_filters,
-        detection_enabled,
-        motion_enabled,
-        stop_event,
-    )
+    ):
+        tensor_input = create_tensor_input(frame, model_config, region)
 
-    logger.info(f"{name}: exiting subprocess")
+        detections = []
+        region_detections = object_detector.detect(tensor_input)
+        for d in region_detections:
+            box = d[2]
+            size = region[2] - region[0]
+            x_min = int(max(0, (box[1] * size) + region[0]))
+            y_min = int(max(0, (box[0] * size) + region[1]))
+            x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
+            y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
 
-
-def box_overlaps(b1, b2):
-    if b1[2] < b2[0] or b1[0] > b2[2] or b1[1] > b2[3] or b1[3] < b2[1]:
-        return False
-    return True
-
-
-def box_inside(b1, b2):
-    # check if b2 is inside b1
-    if b2[0] >= b1[0] and b2[1] >= b1[1] and b2[2] <= b1[2] and b2[3] <= b1[3]:
-        return True
-    return False
-
-
-def reduce_boxes(boxes, iou_threshold=0.0):
-    clusters = []
-
-    for box in boxes:
-        matched = 0
-        for cluster in clusters:
-            if intersection_over_union(box, cluster) > iou_threshold:
-                matched = 1
-                cluster[0] = min(cluster[0], box[0])
-                cluster[1] = min(cluster[1], box[1])
-                cluster[2] = max(cluster[2], box[2])
-                cluster[3] = max(cluster[3], box[3])
-
-        if not matched:
-            clusters.append(list(box))
-
-    return [tuple(c) for c in clusters]
-
-
-def intersects_any(box_a, boxes):
-    for box in boxes:
-        if box_overlaps(box_a, box):
-            return True
-    return False
-
-
-def detect(
-    detect_config: DetectConfig,
-    object_detector,
-    frame,
-    model_config,
-    region,
-    objects_to_track,
-    object_filters,
-):
-    tensor_input = create_tensor_input(frame, model_config, region)
-
-    detections = []
-    region_detections = object_detector.detect(tensor_input)
-    for d in region_detections:
-        box = d[2]
-        size = region[2] - region[0]
-        x_min = int(max(0, (box[1] * size) + region[0]))
-        y_min = int(max(0, (box[0] * size) + region[1]))
-        x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
-        y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
-
-        # ignore objects that were detected outside the frame
-        if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
-            continue
-
-        width = x_max - x_min
-        height = y_max - y_min
-        area = width * height
-        ratio = width / height
-        det = (
-            d[0],
-            d[1],
-            (x_min, y_min, x_max, y_max),
-            area,
-            ratio,
-            region,
-        )
-        # apply object filters
-        if filtered(det, objects_to_track, object_filters):
-            continue
-        detections.append(det)
-    return detections
-
-
-def get_cluster_boundary(box, min_region):
-    # compute the max region size for the current box (box is 10% of region)
-    box_width = box[2] - box[0]
-    box_height = box[3] - box[1]
-    max_region_area = abs(box_width * box_height) / 0.1
-    max_region_size = max(min_region, int(math.sqrt(max_region_area)))
-
-    centroid = (box_width / 2 + box[0], box_height / 2 + box[1])
-
-    max_x_dist = int(max_region_size - box_width / 2 * 1.1)
-    max_y_dist = int(max_region_size - box_height / 2 * 1.1)
-
-    return [
-        int(centroid[0] - max_x_dist),
-        int(centroid[1] - max_y_dist),
-        int(centroid[0] + max_x_dist),
-        int(centroid[1] + max_y_dist),
-    ]
-
-
-def get_cluster_candidates(frame_shape, min_region, boxes):
-    # and create a cluster of other boxes using it's max region size
-    # only include boxes where the region is an appropriate(except the region could possibly be smaller?)
-    # size in the cluster. in order to be in the cluster, the furthest corner needs to be within x,y offset
-    # determined by the max_region size minus half the box + 20%
-    # TODO: see if we can do this with numpy
-    cluster_candidates = []
-    used_boxes = []
-    # loop over each box
-    for current_index, b in enumerate(boxes):
-        if current_index in used_boxes:
-            continue
-        cluster = [current_index]
-        used_boxes.append(current_index)
-        cluster_boundary = get_cluster_boundary(b, min_region)
-        # find all other boxes that fit inside the boundary
-        for compare_index, compare_box in enumerate(boxes):
-            if compare_index in used_boxes:
+            # ignore objects that were detected outside the frame
+            if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
                 continue
 
-            # if the box is not inside the potential cluster area, cluster them
-            if not box_inside(cluster_boundary, compare_box):
-                continue
-
-            # get the region if you were to add this box to the cluster
-            potential_cluster = cluster + [compare_index]
-            cluster_region = get_cluster_region(
-                frame_shape, min_region, potential_cluster, boxes
+            width = x_max - x_min
+            height = y_max - y_min
+            area = width * height
+            ratio = width / height
+            det = (
+                d[0],
+                d[1],
+                (x_min, y_min, x_max, y_max),
+                area,
+                ratio,
+                region,
             )
-            # if region could be smaller and either box would be too small
-            # for the resulting region, dont cluster
-            should_cluster = True
-            if (cluster_region[2] - cluster_region[0]) > min_region:
-                for b in potential_cluster:
-                    box = boxes[b]
-                    # boxes should be more than 5% of the area of the region
-                    if area(box) / area(cluster_region) < 0.05:
-                        should_cluster = False
-                        break
-
-            if should_cluster:
-                cluster.append(compare_index)
-                used_boxes.append(compare_index)
-        cluster_candidates.append(cluster)
-
-    # return the unique clusters only
-    unique = {tuple(sorted(c)) for c in cluster_candidates}
-    return [list(tup) for tup in unique]
+            # apply object filters
+            if filtered(det, objects_to_track, object_filters):
+                continue
+            detections.append(det)
+        return detections
 
 
-def get_cluster_region(frame_shape, min_region, cluster, boxes):
-    min_x = frame_shape[1]
-    min_y = frame_shape[0]
-    max_x = 0
-    max_y = 0
-    for b in cluster:
-        min_x = min(boxes[b][0], min_x)
-        min_y = min(boxes[b][1], min_y)
-        max_x = max(boxes[b][2], max_x)
-        max_y = max(boxes[b][3], max_y)
-    return calculate_region(
-        frame_shape, min_x, min_y, max_x, max_y, min_region, multiplier=1.2
-    )
+    def get_cluster_boundary(self, box, min_region):
+        # compute the max region size for the current box (box is 10% of region)
+        box_width = box[2] - box[0]
+        box_height = box[3] - box[1]
+        max_region_area = abs(box_width * box_height) / 0.1
+        max_region_size = max(min_region, int(math.sqrt(max_region_area)))
+
+        centroid = (box_width / 2 + box[0], box_height / 2 + box[1])
+
+        max_x_dist = int(max_region_size - box_width / 2 * 1.1)
+        max_y_dist = int(max_region_size - box_height / 2 * 1.1)
+
+        return [
+            int(centroid[0] - max_x_dist),
+            int(centroid[1] - max_y_dist),
+            int(centroid[0] + max_x_dist),
+            int(centroid[1] + max_y_dist),
+        ]
 
 
-def get_consolidated_object_detections(detected_object_groups):
-    """Drop detections that overlap too much"""
-    consolidated_detections = []
-    for group in detected_object_groups.values():
-        # if the group only has 1 item, skip
-        if len(group) == 1:
-            consolidated_detections.append(group[0])
-            continue
+    def get_cluster_candidates(self, frame_shape, min_region, boxes):
+        # and create a cluster of other boxes using it's max region size
+        # only include boxes where the region is an appropriate(except the region could possibly be smaller?)
+        # size in the cluster. in order to be in the cluster, the furthest corner needs to be within x,y offset
+        # determined by the max_region size minus half the box + 20%
+        # TODO: see if we can do this with numpy
+        cluster_candidates = []
+        used_boxes = []
+        # loop over each box
+        for current_index, b in enumerate(boxes):
+            if current_index in used_boxes:
+                continue
+            cluster = [current_index]
+            used_boxes.append(current_index)
+            cluster_boundary = self.get_cluster_boundary(b, min_region)
+            # find all other boxes that fit inside the boundary
+            for compare_index, compare_box in enumerate(boxes):
+                if compare_index in used_boxes:
+                    continue
 
-        # sort smallest to largest by area
-        sorted_by_area = sorted(group, key=lambda g: g[3])
+                # if the box is not inside the potential cluster area, cluster them
+                if not self.box_inside(cluster_boundary, compare_box):
+                    continue
 
-        for current_detection_idx in range(0, len(sorted_by_area)):
-            current_detection = sorted_by_area[current_detection_idx][2]
-            overlap = 0
-            for to_check_idx in range(
-                min(current_detection_idx + 1, len(sorted_by_area)),
-                len(sorted_by_area),
-            ):
-                to_check = sorted_by_area[to_check_idx][2]
-                intersect_box = intersection(current_detection, to_check)
-                # if 90% of smaller detection is inside of another detection, consolidate
-                if (
-                    intersect_box is not None
-                    and area(intersect_box) / area(current_detection) > 0.9
-                ):
-                    overlap = 1
-                    break
-            if overlap == 0:
-                consolidated_detections.append(sorted_by_area[current_detection_idx])
+                # get the region if you were to add this box to the cluster
+                potential_cluster = cluster + [compare_index]
+                cluster_region = self.get_cluster_region(
+                    frame_shape, min_region, potential_cluster, boxes
+                )
+                # if region could be smaller and either box would be too small
+                # for the resulting region, dont cluster
+                should_cluster = True
+                if (cluster_region[2] - cluster_region[0]) > min_region:
+                    for b in potential_cluster:
+                        box = boxes[b]
+                        # boxes should be more than 5% of the area of the region
+                        if area(box) / area(cluster_region) < 0.05:
+                            should_cluster = False
+                            break
 
-    return consolidated_detections
+                if should_cluster:
+                    cluster.append(compare_index)
+                    used_boxes.append(compare_index)
+            cluster_candidates.append(cluster)
+
+        # return the unique clusters only
+        unique = {tuple(sorted(c)) for c in cluster_candidates}
+        return [list(tup) for tup in unique]
 
 
-def process_frames(
-    camera_name: str,
-    frame_queue: mp.Queue,
-    frame_shape,
-    model_config,
-    detect_config: DetectConfig,
-    frame_manager: FrameManager,
-    motion_detector: MotionDetector,
-    object_detector: RemoteObjectDetector,
-    object_tracker: ObjectTracker,
-    detected_objects_queue: mp.Queue,
-    process_info: dict,
-    objects_to_track: list[str],
-    object_filters,
-    detection_enabled: mp.Value,
-    motion_enabled: mp.Value,
-    stop_event,
-    exit_on_empty: bool = False,
-):
-    # attribute labels are not tracked and are not assigned regions
-    attribute_label_map = {
-        "person": ["face", "amazon"],
-        "car": ["ups", "fedex", "amazon", "license_plate"],
-    }
-    all_attribute_labels = [
-        item for sublist in attribute_label_map.values() for item in sublist
-    ]
-    fps = process_info["process_fps"]
-    detection_fps = process_info["detection_fps"]
-    current_frame_time = process_info["detection_frame"]
-
-    fps_tracker = EventsPerSecond()
-    fps_tracker.start()
-
-    startup_scan_counter = 0
-
-    region_min_size = int(max(model_config.height, model_config.width) / 2)
-    local_detection_enabled = detection_enabled.value
-    local_motion_enabled = motion_enabled.value
-    last_update = time.perf_counter()
-
-    if camera_name == "sewing":
-      start_pop = time.process_time()
-    while not stop_event.is_set():
-        try:
-            frame_time = frame_queue.get(True, 1)
-        except queue.Empty:
-            if exit_on_empty:
-                logger.info("Exiting track_objects...")
-                break
-            continue
-
-        if camera_name == "sewing":
-           start = time.process_time()
-           logger.info(f"Took {start - start_pop}s of CPU time to get a frame")
-           start_pop = start
-
-        now = time.perf_counter()
-        if now - last_update > 1:
-            current_frame_time.value = frame_time
-            local_detection_enabled = detection_enabled.value
-            local_motion_enabled = motion_enabled.value
-
-        frame = frame_manager.get(
-            f"{camera_name}{frame_time}", (frame_shape[0] * 3 // 2, frame_shape[1])
+    def get_cluster_region(self, frame_shape, min_region, cluster, boxes):
+        min_x = frame_shape[1]
+        min_y = frame_shape[0]
+        max_x = 0
+        max_y = 0
+        for b in cluster:
+            min_x = min(boxes[b][0], min_x)
+            min_y = min(boxes[b][1], min_y)
+            max_x = max(boxes[b][2], max_x)
+            max_y = max(boxes[b][3], max_y)
+        return calculate_region(
+            frame_shape, min_x, min_y, max_x, max_y, min_region, multiplier=1.2
         )
 
-        if frame is None:
-            logger.info(f"{camera_name}: frame {frame_time} is not in memory store.")
-            continue
+    def get_consolidated_object_detections(self, detected_object_groups):
+        """Drop detections that overlap too much"""
+        consolidated_detections = []
+        for group in detected_object_groups.values():
+            # if the group only has 1 item, skip
+            if len(group) == 1:
+                consolidated_detections.append(group[0])
+                continue
+
+            # sort smallest to largest by area
+            sorted_by_area = sorted(group, key=lambda g: g[3])
+
+            for current_detection_idx in range(0, len(sorted_by_area)):
+                current_detection = sorted_by_area[current_detection_idx][2]
+                overlap = 0
+                for to_check_idx in range(
+                    min(current_detection_idx + 1, len(sorted_by_area)),
+                    len(sorted_by_area),
+                ):
+                    to_check = sorted_by_area[to_check_idx][2]
+                    intersect_box = intersection(current_detection, to_check)
+                    # if 90% of smaller detection is inside of another detection, consolidate
+                    if (
+                        intersect_box is not None
+                        and area(intersect_box) / area(current_detection) > 0.9
+                    ):
+                        overlap = 1
+                        break
+                if overlap == 0:
+                    consolidated_detections.append(sorted_by_area[current_detection_idx])
+
+        return consolidated_detections
+        
+    def process_frame(
+        self,
+        frame_time,
+        frame_name,
+        frame_manager: FrameManager,
+    ):
+        frame = frame_manager.get(
+            frame_name, (self.frame_shape[0] * 3 // 2, self.frame_shape[1])
+        )
 
         # look for motion if enabled
-        motion_boxes = motion_detector.detect(frame) if local_motion_enabled else []
+        motion_boxes = self.motion_detector.detect(frame) if self.local_motion_enabled else []
 
         regions = []
         consolidated_detections = []
 
         # if detection is disabled
-        if not local_detection_enabled:
-            object_tracker.match_and_update(frame_time, [])
+        if not self.local_detection_enabled:
+            self.object_tracker.match_and_update(frame_time, [])
         else:
             # get stationary object ids
             # check every Nth frame for stationary objects
@@ -802,58 +743,58 @@ def process_frames(
             # also check for overlapping motion boxes
             stationary_object_ids = [
                 obj["id"]
-                for obj in object_tracker.tracked_objects.values()
+                for obj in self.object_tracker.tracked_objects.values()
                 # if it has exceeded the stationary threshold
-                if obj["motionless_count"] >= detect_config.stationary.threshold
+                if obj["motionless_count"] >= self.detect_config.stationary.threshold
                 # and it isn't due for a periodic check
                 and (
-                    detect_config.stationary.interval == 0
-                    or obj["motionless_count"] % detect_config.stationary.interval != 0
+                    self.detect_config.stationary.interval == 0
+                    or obj["motionless_count"] % self.detect_config.stationary.interval != 0
                 )
                 # and it hasn't disappeared
-                and object_tracker.disappeared[obj["id"]] == 0
+                and self.object_tracker.disappeared[obj["id"]] == 0
                 # and it doesn't overlap with any current motion boxes
-                and not intersects_any(obj["box"], motion_boxes)
+                and not self.intersects_any(obj["box"], motion_boxes)
             ]
 
             # get tracked object boxes that aren't stationary
             tracked_object_boxes = [
                 obj["estimate"]
-                for obj in object_tracker.tracked_objects.values()
+                for obj in self.object_tracker.tracked_objects.values()
                 if obj["id"] not in stationary_object_ids
             ]
 
             combined_boxes = motion_boxes + tracked_object_boxes
 
-            cluster_candidates = get_cluster_candidates(
-                frame_shape, region_min_size, combined_boxes
+            cluster_candidates = self.get_cluster_candidates(
+                self.frame_shape, self.region_min_size, combined_boxes
             )
 
             regions = [
-                get_cluster_region(
-                    frame_shape, region_min_size, candidate, combined_boxes
+                self.get_cluster_region(
+                    self.frame_shape, self.region_min_size, candidate, combined_boxes
                 )
                 for candidate in cluster_candidates
             ]
 
             # if starting up, get the next startup scan region
-            if startup_scan_counter < 9:
-                ymin = int(frame_shape[0] / 3 * startup_scan_counter / 3)
-                ymax = int(frame_shape[0] / 3 + ymin)
-                xmin = int(frame_shape[1] / 3 * startup_scan_counter / 3)
-                xmax = int(frame_shape[1] / 3 + xmin)
+            if self.startup_scan_counter < 9:
+                ymin = int(self.frame_shape[0] / 3 * self.startup_scan_counter / 3)
+                ymax = int(self.frame_shape[0] / 3 + ymin)
+                xmin = int(self.frame_shape[1] / 3 * self.startup_scan_counter / 3)
+                xmax = int(self.frame_shape[1] / 3 + xmin)
                 regions.append(
                     calculate_region(
-                        frame_shape,
+                        self.frame_shape,
                         xmin,
                         ymin,
                         xmax,
                         ymax,
-                        region_min_size,
+                        self.region_min_size,
                         multiplier=1.2,
                     )
                 )
-                startup_scan_counter += 1
+                self.startup_scan_counter += 1
 
             # resize regions and detect
             # seed with stationary objects
@@ -866,29 +807,22 @@ def process_frames(
                     obj["ratio"],
                     obj["region"],
                 )
-                for obj in object_tracker.tracked_objects.values()
+                for obj in self.object_tracker.tracked_objects.values()
                 if obj["id"] in stationary_object_ids
             ]
 
-            if len(regions) > 2:
-              detect_start_process = time.process_time()
-              detect_start_clock = time.perf_counter()
             for region in regions:
                 detections.extend(
-                    detect(
-                        detect_config,
-                        object_detector,
+                    self.detect(
+                        self.detect_config,
+                        self.object_detector,
                         frame,
-                        model_config,
+                        self.model_config,
                         region,
-                        objects_to_track,
-                        object_filters,
+                        self.objects_to_track,
+                        self.object_filters,
                     )
                 )
-            if len(regions) > 2:
-                detect_end_process = time.process_time()
-                detect_end_clock = time.perf_counter()
-                logger.info(f"It took {detect_end_clock - detect_start_clock}s ({detect_end_process-detect_start_process}s CPU time) to run {len(regions)} object detections on camera {camera_name}")
 
             #########
             # merge objects
@@ -931,36 +865,36 @@ def process_frames(
                 for detection in detections:
                     detected_object_groups[detection[0]].append(detection)
 
-                consolidated_detections = get_consolidated_object_detections(
+                consolidated_detections = self.get_consolidated_object_detections(
                     detected_object_groups
                 )
                 tracked_detections = [
                     d
                     for d in consolidated_detections
-                    if d[0] not in all_attribute_labels
+                    if d[0] not in self.all_attribute_labels
                 ]
                 # now that we have refined our detections, we need to track objects
-                object_tracker.match_and_update(frame_time, tracked_detections)
+                self.object_tracker.match_and_update(frame_time, tracked_detections)
             # else, just update the frame times for the stationary objects
             else:
-                object_tracker.update_frame_times(frame_time)
+                self.object_tracker.update_frame_times(frame_time)
 
         # group the attribute detections based on what label they apply to
         attribute_detections = {}
-        for label, attribute_labels in attribute_label_map.items():
+        for label, attribute_labels in self.attribute_label_map.items():
             attribute_detections[label] = [
                 d for d in consolidated_detections if d[0] in attribute_labels
             ]
 
         # build detections and add attributes
         detections = {}
-        for obj in object_tracker.tracked_objects.values():
+        for obj in self.object_tracker.tracked_objects.values():
             attributes = []
             # if the objects label has associated attribute detections
             if obj["label"] in attribute_detections.keys():
                 # add them to attributes if they intersect
                 for attribute_detection in attribute_detections[obj["label"]]:
-                    if box_inside(obj["box"], (attribute_detection[2])):
+                    if self.box_inside(obj["box"], (attribute_detection[2])):
                         attributes.append(
                             {
                                 "label": attribute_detection[0],
@@ -976,7 +910,7 @@ def process_frames(
                 frame,
                 cv2.COLOR_YUV2BGR_I420,
             )
-            object_tracker.debug_draw(bgr_frame, frame_time)
+            self.object_tracker.debug_draw(bgr_frame, frame_time)
             cv2.imwrite(
                 f"debug/frames/track-{'{:.6f}'.format(frame_time)}.jpg", bgr_frame
             )
@@ -1005,10 +939,10 @@ def process_frames(
                     2,
                 )
 
-            for obj in object_tracker.tracked_objects.values():
+            for obj in self.object_tracker.tracked_objects.values():
                 if obj["frame_time"] == frame_time:
                     thickness = 2
-                    color = model_config.colormap[obj["label"]]
+                    color = self.model_config.colormap[obj["label"]]
                 else:
                     thickness = 1
                     color = (255, 0, 0)
@@ -1042,22 +976,19 @@ def process_frames(
                 bgr_frame,
             )
         # add to the queue if not full
-        if detected_objects_queue.full():
-            frame_manager.delete(f"{camera_name}{frame_time}")
-            continue
+        if self.detected_objects_queue.full():
+            frame_manager.delete(frame_name)
         else:
-            fps_tracker.update()
-            fps.value = fps_tracker.eps()
-            detected_objects_queue.put(
+            self.fps_tracker.update()
+            self.fps.value = self.fps_tracker.eps()
+            self.detected_objects_queue.put(
                 (
-                    camera_name,
+                    self.camera_name,
                     frame_time,
                     detections,
                     motion_boxes,
                     regions,
                 )
             )
-            detection_fps.value = object_detector.fps.eps()
-            frame_manager.close(f"{camera_name}{frame_time}")
-        if camera_name == "sewing":
-          logger.info(f"took {time.process_time() - start}s to process a frame in sewing")
+            self.detection_fps.value = self.object_detector.fps.eps()
+            frame_manager.close(frame_name)
