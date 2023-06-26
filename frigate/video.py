@@ -870,6 +870,9 @@ def process_frames(
                 if obj["id"] in stationary_object_ids
             ]
 
+            if len(regions) > 2:
+              detect_start_process = time.process_time()
+              detect_start_clock = time.perf_counter()
             for region in regions:
                 detections.extend(
                     detect(
@@ -882,6 +885,10 @@ def process_frames(
                         object_filters,
                     )
                 )
+            if len(regions) > 2:
+                detect_end_process = time.process_time()
+                detect_end_clock = time.perf_counter()
+                logger.info(f"It took {detect_end_clock - detect_start_clock}s ({detect_end_process-detect_start_process}s CPU time) to run {len(regions)} object detections on camera {camera_name}")
 
             #########
             # merge objects
